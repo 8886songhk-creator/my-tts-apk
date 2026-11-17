@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Studio Cloud APK
 
 on:
   workflow_dispatch:
@@ -25,6 +25,149 @@ jobs:
           yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_DIR" --licenses > /dev/null || true
           "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_DIR" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: 원본 Studio Cloud 아이콘 추출 및 알림 이름 동기화
+        run: |
+          sed -i 's/원고 오디오 재생 중/Studio Cloud/g' app/src/main/java/com/novel/ttsreader/TtsService.java || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pil librsvg2-bin fonts-noto-color-emoji fonts-noto-cjk
+          cat << 'PYEOF' > /tmp/gen_icon.py
+          import base64, io, json, os, re, subprocess, urllib.parse, urllib.request
+          from PIL import Image, ImageDraw
+
+          BASE_URL = "https://8886songhk-creator.github.io/studio-app/"
+
+          def parse_hex_color(val, default=(11, 17, 32)):
+              if not val or not isinstance(val, str):
+                  return default
+              s = val.strip().lstrip("#")
+              if len(s) == 3 and all(c in "0123456789abcdefABCDEF" for c in s):
+                  s = "".join(c * 2 for c in s)
+              if len(s) >= 6 and all(c in "0123456789abcdefABCDEF" for c in s[:6]):
+                  return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+              return default
+
+          def fetch_bytes(url_or_data, base):
+              if url_or_data.startswith("data:"):
+                  header, payload = url_or_data.split(",", 1)
+                  if ";base64" in header:
+                      return base64.b64decode(payload), header
+                  return urllib.parse.unquote_to_bytes(payload), header
+              full_url = urllib.parse.urljoin(base, url_or_data)
+              req = urllib.request.Request(full_url, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  return resp.read(), resp.headers.get("Content-Type", "")
+
+          def bytes_to_rgba(raw, hint=""):
+              head = raw[:300].lstrip()
+              is_svg = ("svg" in hint.lower()) or head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in raw[:2000])
+              if is_svg:
+                  with open("/tmp/icon_src.svg", "wb") as f:
+                      f.write(raw)
+                  subprocess.run(["rsvg-convert", "-w", "1024", "-h", "1024", "/tmp/icon_src.svg", "-o", "/tmp/icon_src.png"], check=True)
+                  return Image.open("/tmp/icon_src.png").convert("RGBA")
+              return Image.open(io.BytesIO(raw)).convert("RGBA")
+
+          img = None
+          bg_rgb = (11, 17, 32)
+          strict_maskable = False
+
+          for local_name in ["icon.png", "icon.webp", "icon.jpg", "icon.svg"]:
+              if os.path.exists(local_name):
+                  try:
+                      with open(local_name, "rb") as f:
+                          img = bytes_to_rgba(f.read(), local_name)
+                      break
+                  except Exception:
+                      pass
+
+          if img is None:
+              try:
+                  m_bytes, _ = fetch_bytes("manifest.json", BASE_URL)
+                  manifest = json.loads(m_bytes.decode("utf-8-sig"))
+                  bg_rgb = parse_hex_color(manifest.get("background_color") or manifest.get("theme_color"), (11, 17, 32))
+                  scored = []
+                  for ic in (manifest.get("icons") or []):
+                      src = (ic.get("src") or "").strip()
+                      if not src:
+                          continue
+                      sizes_str = str(ic.get("sizes") or "")
+                      nums = [int(x) for x in re.findall(r"\d+", sizes_str)]
+                      max_sz = max(nums) if nums else (512 if "any" in sizes_str.lower() else 192)
+                      itype = str(ic.get("type") or "") + src
+                      bonus = 50 if ("png" in itype.lower() and max_sz >= 512) else 0
+                      scored.append((max_sz + bonus, src, str(ic.get("purpose") or "")))
+                  scored.sort(key=lambda x: x[0], reverse=True)
+                  for _, src, purpose in scored:
+                      try:
+                          raw, ctype = fetch_bytes(src, BASE_URL + "manifest.json")
+                          img = bytes_to_rgba(raw, ctype + " " + src)
+                          p_words = purpose.lower().split()
+                          strict_maskable = ("maskable" in p_words and "any" not in p_words)
+                          break
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+
+          if img is None:
+              for fb in ["icon-512.png", "icon-192.png", "icon.png", "icon.svg", "apple-touch-icon.png", "favicon.png", "favicon.ico"]:
+                  try:
+                      raw, ctype = fetch_bytes(fb, BASE_URL)
+                      img = bytes_to_rgba(raw, ctype + " " + fb)
+                      break
+                  except Exception:
+                      pass
+
+          if img is None:
+              img = Image.new("RGBA", (512, 512), (11, 17, 32, 255))
+              d = ImageDraw.Draw(img)
+              d.rounded_rectangle([56, 56, 456, 456], radius=96, fill=(30, 41, 59, 255), outline=(56, 189, 248, 255), width=12)
+
+          w, h = img.size
+          for sx, sy in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]:
+              if 0 <= sx < w and 0 <= sy < h:
+                  px = img.getpixel((sx, sy))
+                  if len(px) == 4 and px[3] >= 245:
+                      bg_rgb = (px[0], px[1], px[2])
+                      break
+
+          bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_rgb)
+
+          for density, sz in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              out_dir = f"app/src/main/res/mipmap-{density}"
+              os.makedirs(out_dir, exist_ok=True)
+              base_sq = Image.new("RGBA", (sz, sz), bg_rgb + (255,))
+              base_sq.alpha_composite(img.resize((sz, sz), Image.Resampling.LANCZOS))
+              base_sq.convert("RGB").save(f"{out_dir}/ic_launcher.png", "PNG")
+              mask = Image.new("L", (sz, sz), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, sz - 1, sz - 1), fill=255)
+              rnd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+              rnd.paste(base_sq, (0, 0), mask)
+              rnd.save(f"{out_dir}/ic_launcher_round.png", "PNG")
+
+          scale_ratio = 0.92 if strict_maskable else 0.72
+          for density, csz in {"mdpi": 108, "hdpi": 162, "xhdpi": 216, "xxhdpi": 324, "xxxhdpi": 432}.items():
+              out_dir = f"app/src/main/res/mipmap-{density}"
+              os.makedirs(out_dir, exist_ok=True)
+              fg = Image.new("RGBA", (csz, csz), (0, 0, 0, 0))
+              isz = max(1, int(round(csz * scale_ratio)))
+              off = (csz - isz) // 2
+              fg.alpha_composite(img.resize((isz, isz), Image.Resampling.LANCZOS), (off, off))
+              fg.save(f"{out_dir}/ic_launcher_foreground.png", "PNG")
+
+          os.makedirs("app/src/main/res/values", exist_ok=True)
+          with open("app/src/main/res/values/colors.xml", "w", encoding="utf-8") as f:
+              f.write(f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_bg">{bg_hex}</color>\n</resources>\n')
+
+          os.makedirs("app/src/main/res/mipmap-anydpi-v26", exist_ok=True)
+          axml = '<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n    <background android:drawable="@color/ic_launcher_bg" />\n    <foreground android:drawable="@mipmap/ic_launcher_foreground" />\n</adaptive-icon>\n'
+          with open("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w", encoding="utf-8") as f:
+              f.write(axml)
+          with open("app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml", "w", encoding="utf-8") as f:
+              f.write(axml)
+          PYEOF
+          python3 /tmp/gen_icon.py
+
       - name: Gradle 설정 파일 자동 생성
         run: |
           mkdir -p app
@@ -45,7 +188,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "TtsReaderApp"
+          rootProject.name = "StudioCloud"
           include ':app'
           EOF
           cat << 'EOF' > app/build.gradle
@@ -60,8 +203,8 @@ jobs:
                   applicationId "com.novel.ttsreader"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -72,13 +215,13 @@ jobs:
 
       - name: APK 빌드 실행
         run: |
-          find app -type f
           curl -sSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /tmp
           /tmp/gradle-8.7/bin/gradle assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk "app/build/outputs/apk/debug/Studio Cloud.apk"
 
       - name: 완성된 APK 업로드
         uses: actions/upload-artifact@v4
         with:
-          name: Novel-TTS-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Studio Cloud
+          path: app/build/outputs/apk/debug/Studio Cloud.apk
