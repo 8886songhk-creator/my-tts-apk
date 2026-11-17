@@ -16,7 +16,7 @@ import android.webkit.WebViewClient;
 public class MainActivity extends Activity {
 
     // 아래 큰따옴표 안의 주소만 본인의 깃허브 페이지 주소로 바꿔 주세요!
-    private static final String MY_WEB_URL = "https://github.com/8886songhk-creator/studio-app";
+    private static final String MY_WEB_URL = "https://8886songhk-creator.github.io/studio-app/";
 
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
